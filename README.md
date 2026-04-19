@@ -27,9 +27,19 @@ This will:
 | Backend API    | http://localhost:5001    |
 | Claude Bridge  | ws://localhost:9100      |
 
-## Backend Environment
+## Environment Files
 
-Before running, create `../gtv-backend/.env` with your credentials (get from Railway dashboard or team):
+### Frontend (`../gtv-frontend/apps/web/.env.local`)
+
+```
+NEXT_PUBLIC_SUPABASE_URL=...
+NEXT_PUBLIC_SUPABASE_KEY=...
+NEXT_PUBLIC_API_URL=http://localhost:5001
+```
+
+### Backend (`../gtv-backend/.env`)
+
+Get credentials from Railway dashboard or team:
 
 ```
 SUPABASE_PROJECT_ID=...
