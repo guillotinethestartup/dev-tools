@@ -50,6 +50,38 @@ claude-bridge/     — WebSocket server bridging browser to persistent Claude CL
 claude-widget/     — React chat widget, installed into frontend in dev mode only
 ```
 
+## Claude Widget + Bridge Architecture
+
+The dev chat widget gives engineers an in-browser chat interface to Claude CLI while developing. It's a two-part system:
+
+### Bridge (`claude-bridge/server.py`)
+
+FastAPI WebSocket server that manages a persistent Claude CLI subprocess per session.
+
+- Spawns Claude with `--input-format stream-json --output-format stream-json` for bidirectional streaming
+- Writes user messages to Claude's stdin, reads responses from stdout, forwards to WebSocket
+- Process stays alive between messages — no respawn per turn, full conversation context preserved
+- SIGINT cancels the current response without killing the process
+- `--resume <session_id>` restarts dead processes with conversation history intact
+- Widget UUID → Claude session ID mapping persisted to `data/widget_sessions.json`
+
+### Widget (`claude-widget/`)
+
+React component that renders a floating chat panel in the web app during development.
+
+- Connects to bridge via WebSocket at `ws://localhost:9100`
+- Sends user text + optional screenshots (html2canvas), console logs, and server logs as context
+- Renders streaming responses with markdown, tool calls (collapsible with JSON input), tool results, and a raw JSON event viewer
+- Conversation history loaded from Claude's native `.claude/` JSONL files via bridge HTTP endpoints
+- Self-contained styling (own CSS variables in `theme.module.css`), no dependency on host app CSS
+
+### How it ships
+
+- `make gtv` installs the widget into gtv-frontend via `npm install --no-save`
+- `DevWidget.tsx` in the web app uses a module-level `process.env.NODE_ENV === 'development'` check
+- Webpack evaluates this at compile time — production builds never create a chunk for widget code (zero bytes)
+- Without dev-tools present, the widget simply doesn't load — no crash, no errors
+
 ## Development
 
 ```sh
