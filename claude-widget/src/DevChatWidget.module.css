@@ -1,25 +1,26 @@
 .fab {
   position: fixed;
-  width: 40px;
-  height: 40px;
-  border-radius: var(--radius-lg);
-  background: rgba(10, 10, 10, 0.92);
+  width: 42px;
+  height: 42px;
+  border-radius: var(--radius-xl);
+  background: var(--surface-base);
   color: var(--color-accent);
   border: 1px solid var(--glass-border);
   display: flex;
   align-items: center;
   justify-content: center;
-  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.3);
-  transition: border-color 0.2s, box-shadow 0.2s, color 0.2s;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.4);
+  transition: border-color 0.2s, box-shadow 0.2s, color 0.2s, transform 0.15s;
   z-index: 9999;
   cursor: grab;
   touch-action: none;
 }
 
 .fab:hover {
-  color: #a0a8e0;
-  border-color: rgba(130, 140, 220, 0.4);
-  box-shadow: 0 0 16px rgba(130, 140, 220, 0.2), 0 4px 12px rgba(0, 0, 0, 0.4);
+  color: var(--color-accent);
+  border-color: var(--tint-7);
+  box-shadow: 0 2px 16px rgba(0, 0, 0, 0.5);
+  transform: scale(1.05);
 }
 
 .dot {
@@ -30,6 +31,7 @@
   height: 6px;
   border-radius: 50%;
   background: var(--color-success);
+  box-shadow: 0 0 6px rgba(93, 187, 160, 0.5);
 }
 
 .dotOff {
@@ -40,4 +42,5 @@
   height: 6px;
   border-radius: 50%;
   background: var(--color-error);
+  box-shadow: 0 0 6px rgba(212, 84, 106, 0.4);
 }

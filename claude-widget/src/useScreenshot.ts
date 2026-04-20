@@ -1,38 +1,60 @@
 import { useState, useCallback } from 'react';
 
-export interface ScreenshotResult {
-  capture: () => Promise<string | null>;
-  isCapturing: boolean;
+export interface CaptureOptions {
+  includeWidget: boolean;
 }
+
+export interface CaptureResult {
+  data: string;
+  width: number;
+  height: number;
+}
+
+export interface ScreenshotResult {
+  capture: (opts?: Partial<CaptureOptions>) => Promise<CaptureResult | null>;
+  isCapturing: boolean;
+  error: string | null;
+}
+
+const DEFAULTS: CaptureOptions = { includeWidget: false };
 
 export function useScreenshot(): ScreenshotResult {
   const [isCapturing, setIsCapturing] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
-  const capture = useCallback(async (): Promise<string | null> => {
+  const capture = useCallback(async (opts?: Partial<CaptureOptions>): Promise<CaptureResult | null> => {
+    const { includeWidget } = { ...DEFAULTS, ...opts };
     setIsCapturing(true);
+    setError(null);
     try {
-      const { default: html2canvas } = await import('html2canvas');
+      const { default: html2canvas } = await import('html2canvas-pro');
 
-      // Capture #root (the app), not the whole body — excludes the chat widget
-      const appRoot = document.getElementById('root');
-      if (!appRoot) return null;
+      const appRoot = document.getElementById('__next') ?? document.getElementById('root') ?? document.body;
 
       const canvas = await html2canvas(appRoot, {
-        scale: 0.5,
+        scale: 0.75,
         useCORS: true,
         logging: false,
         backgroundColor: '#000000',
+        ignoreElements: (el: Element) => {
+          if (!(el instanceof HTMLElement)) return false;
+          if (el.dataset.screenshotPopover === 'true') return true;
+          if (!includeWidget && el.dataset.devWidget === 'true') return true;
+          return false;
+        },
       });
 
-      // Return base64 PNG without the data:image/png;base64, prefix
-      return canvas.toDataURL('image/png').split(',')[1];
+      const data = canvas.toDataURL('image/png').split(',')[1];
+      return { data, width: canvas.width, height: canvas.height };
     } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
       console.error('Screenshot capture failed:', err);
+      setError(msg);
       return null;
     } finally {
       setIsCapturing(false);
     }
   }, []);
 
-  return { capture, isCapturing };
+  return { capture, isCapturing, error };
 }

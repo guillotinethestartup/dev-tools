@@ -14,7 +14,6 @@ Connects to: ws://localhost:9100
 import asyncio
 import json
 import os
-import signal
 import tempfile
 import time
 import base64
@@ -40,9 +39,88 @@ app.add_middleware(
 CLAUDE = os.path.expanduser("~/.local/bin/claude")
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+
+REPOS = {
+    "gtv-frontend": os.path.join(PROJECT_DIR, "gtv-frontend"),
+    "gtv-backend": os.path.join(PROJECT_DIR, "gtv-backend"),
+    "dev-tools": os.path.join(PROJECT_DIR, "dev-tools"),
+}
+
+APP_CONTEXT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_context.md")
 CLAUDE_PROJECTS_DIR = os.path.expanduser(
-    "~/.claude/projects/-Users-macbrennan-Projects-guillotine-v2"
+    "~/.claude/projects/" + PROJECT_DIR.replace("/", "-").replace("_", "-")
 )
+
+FRONTEND_APP_DIR = os.path.join(PROJECT_DIR, "gtv-frontend", "apps", "web", "src", "app")
+
+CLAUDE_MD_FILES = [
+    os.path.join(PROJECT_DIR, repo, "CLAUDE.md")
+    for repo in ["dev-tools", "gtv-frontend", "gtv-backend"]
+]
+
+GTV_MODE = os.environ.get("GTV_MODE", "local")
+BACKEND_LOG_FILE = os.environ.get("BACKEND_LOG_FILE")
+RAILWAY_ENVIRONMENT = os.environ.get("RAILWAY_ENVIRONMENT")
+
+
+def collect_system_prompts() -> list[dict]:
+    """Read app_context.md and CLAUDE.md files into a list of {name, content} dicts."""
+    prompts = []
+    if os.path.isfile(APP_CONTEXT_FILE):
+        with open(APP_CONTEXT_FILE) as f:
+            prompts.append({"name": "app_context.md", "content": f.read()})
+    for path in CLAUDE_MD_FILES:
+        if os.path.isfile(path):
+            repo = os.path.basename(os.path.dirname(path))
+            with open(path) as f:
+                prompts.append({"name": f"{repo}/CLAUDE.md", "content": f.read()})
+    return prompts
+
+
+def build_route_map() -> list[tuple[str, str]]:
+    """Scan Next.js app directory and build a list of (regex_pattern, file_path) tuples."""
+    import re as _re
+    routes = []
+    if not os.path.isdir(FRONTEND_APP_DIR):
+        return routes
+
+    for root, _dirs, files in os.walk(FRONTEND_APP_DIR):
+        if "page.tsx" not in files and "page.ts" not in files:
+            continue
+        page_file = "page.tsx" if "page.tsx" in files else "page.ts"
+        rel = os.path.relpath(root, FRONTEND_APP_DIR)
+
+        # Build URL pattern from directory structure
+        segments = [] if rel == "." else rel.split(os.sep)
+        url_parts = []
+        for seg in segments:
+            if seg.startswith("(") and seg.endswith(")"):
+                continue  # route groups don't appear in URL
+            elif seg.startswith("[") and seg.endswith("]"):
+                url_parts.append("[^/]+")
+            else:
+                url_parts.append(_re.escape(seg))
+
+        pattern = "^/" + "/".join(url_parts) + "/?$" if url_parts else "^/?$"
+        filepath = os.path.join(root, page_file)
+        rel_filepath = os.path.relpath(filepath, PROJECT_DIR)
+        routes.append((pattern, rel_filepath))
+
+    # Sort longer patterns first so specific routes match before generic ones
+    routes.sort(key=lambda r: -len(r[0]))
+    return routes
+
+
+route_map = build_route_map()
+
+
+def resolve_page_url(pathname: str) -> str | None:
+    """Match a URL pathname to its Next.js page source file."""
+    import re as _re
+    for pattern, filepath in route_map:
+        if _re.match(pattern, pathname):
+            return filepath
+    return None
 
 # In-memory cache for Claude to write data, frontend to read
 cache: dict[str, any] = {}
@@ -54,10 +132,10 @@ widget_sessions: dict[str, str] = {}  # widget_uuid → session_id
 # Live sessions with persistent processes
 sessions: dict[str, "Session"] = {}  # session_id → Session
 
-# --- Server log capture ---
+# --- Logging ---
 MAX_LOG_ENTRIES = 500
 log_buffer: deque = deque(maxlen=MAX_LOG_ENTRIES)
-log_subscribers: set = set()
+_backend_log_pos: int = 0
 
 
 def now_ms() -> int:
@@ -65,30 +143,90 @@ def now_ms() -> int:
 
 
 def server_log(text: str, level: str = "info"):
-    """Capture a log line and broadcast to all connected WebSocket clients."""
-    entry = {
-        "type": "log.entry",
+    """Bridge-internal log line (printed to terminal, not sent to widget)."""
+    print(f"[bridge:{level}] {text}")
+
+
+def backend_log(text: str, level: str = "info"):
+    """Append a backend log line to the in-memory buffer (served via GET /logs)."""
+    log_buffer.append({
         "text": text,
         "level": level,
         "ts": now_ms(),
-    }
-    log_buffer.append(entry)
-    print(f"[{level}] {text}")
+    })
+
+
+def _parse_log_level(line: str) -> str:
+    """Extract log level from a uvicorn/Python log line."""
+    upper = line.lstrip().upper()
+    if upper.startswith(("ERROR:", "CRITICAL:")):
+        return "error"
+    if upper.startswith(("WARNING:", "WARN:")):
+        return "warn"
+    if upper.startswith("DEBUG:"):
+        return "debug"
+    return "info"
+
+
+def _ingest_backend_log_file():
+    """Read new lines from the backend log file into the buffer."""
+    global _backend_log_pos
+    if not BACKEND_LOG_FILE or not os.path.isfile(BACKEND_LOG_FILE):
+        return
+    with open(BACKEND_LOG_FILE, "r") as f:
+        f.seek(_backend_log_pos)
+        for line in f:
+            text = line.rstrip("\n\r")
+            if text:
+                log_buffer.append({
+                    "text": text,
+                    "level": _parse_log_level(text),
+                    "ts": now_ms(),
+                })
+        _backend_log_pos = f.tell()
+
+
+async def _stream_railway_logs():
+    """Stream logs from Railway for the staging backend."""
+    server_log("Starting Railway log streaming...")
+
+    backend_dir = os.path.join(PROJECT_DIR, "gtv-backend")
+    cmd = ["railway", "logs", "--json"]
+    if RAILWAY_ENVIRONMENT:
+        cmd.extend(["--environment", RAILWAY_ENVIRONMENT])
+
     try:
-        loop = asyncio.get_running_loop()
-        loop.create_task(_broadcast_log(entry))
-    except RuntimeError:
-        pass
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=backend_dir,
+        )
 
+        async for line_bytes in proc.stdout:
+            line = line_bytes.decode().strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                text = obj.get("message", line)
+                severity = obj.get("severity", "info").lower()
+                level_map = {"error": "error", "warn": "warn", "warning": "warn",
+                             "debug": "debug", "info": "info"}
+                backend_log(text, level_map.get(severity, "info"))
+            except json.JSONDecodeError:
+                backend_log(line, _parse_log_level(line))
 
-async def _broadcast_log(entry: dict):
-    dead = set()
-    for ws in log_subscribers:
-        try:
-            await ws.send_json(entry)
-        except Exception:
-            dead.add(ws)
-    log_subscribers.difference_update(dead)
+        await proc.wait()
+        if proc.returncode != 0:
+            stderr_out = await proc.stderr.read()
+            err = stderr_out.decode().strip()
+            backend_log(f"Railway logs stopped: {err}", "error")
+
+    except FileNotFoundError:
+        backend_log("Railway CLI not found. Install: npm i -g @railway/cli", "error")
+    except Exception as e:
+        backend_log(f"Railway log streaming failed: {e}", "error")
 
 
 # --- Widget session mapping persistence ---
@@ -124,7 +262,6 @@ class Session:
         self.process: Optional[asyncio.subprocess.Process] = None
         self.stdout_task: Optional[asyncio.Task] = None
         self.stderr_task: Optional[asyncio.Task] = None
-        self.stream_buffer: str = ""
         self.websocket: Optional[WebSocket] = None
 
     async def start_process(self, resume_id: Optional[str] = None):
@@ -133,11 +270,16 @@ class Session:
             CLAUDE, "-p",
             "--input-format", "stream-json",
             "--output-format", "stream-json",
+            "--model", "claude-opus-4-7",
+            "--effort", "max",
             "--verbose",
+            "--include-partial-messages",
             "--dangerously-skip-permissions",
         ]
         if resume_id:
             cmd.extend(["--resume", resume_id])
+        else:
+            cmd.extend(["--append-system-prompt-file", APP_CONTEXT_FILE])
 
         label = f"resume={resume_id}" if resume_id else "new"
         server_log(f"Starting Claude process ({label})")
@@ -166,15 +308,8 @@ class Session:
             "type": "user",
             "message": {"role": "user", "content": content},
         })
-        self.stream_buffer = ""
         self.process.stdin.write((msg + "\n").encode())
         await self.process.stdin.drain()
-
-    async def cancel(self):
-        """Send SIGINT to cancel current response without killing the process."""
-        if self.is_alive:
-            self.process.send_signal(signal.SIGINT)
-            server_log("Sent SIGINT to Claude process")
 
     async def kill(self):
         """Terminate the process and cancel background tasks."""
@@ -239,22 +374,27 @@ class Session:
                             "type": "stream.init",
                             "sessionId": event.get("session_id", ""),
                         })
+                        await self._send_ws({
+                            "type": "stream.system_prompts",
+                            "prompts": collect_system_prompts(),
+                        })
+
+                elif event_type == "stream_event":
+                    se = event.get("event", {})
+                    if se.get("type") == "content_block_delta":
+                        delta = se.get("delta", {})
+                        if delta.get("type") == "text_delta" and delta.get("text"):
+                            await self._send_ws({
+                                "type": "stream.text",
+                                "text": delta["text"],
+                            })
 
                 elif event_type == "assistant":
                     content = event.get("message", {}).get("content", [])
                     for block in content:
                         if not isinstance(block, dict):
                             continue
-                        if block.get("type") == "text":
-                            text = block["text"]
-                            if len(text) > len(self.stream_buffer):
-                                delta = text[len(self.stream_buffer):]
-                                self.stream_buffer = text
-                                await self._send_ws({
-                                    "type": "stream.text",
-                                    "text": delta,
-                                })
-                        elif block.get("type") == "tool_use":
+                        if block.get("type") == "tool_use":
                             await self._send_ws({
                                 "type": "stream.tool_use",
                                 "name": block.get("name", "unknown"),
@@ -262,22 +402,18 @@ class Session:
                                 "input": block.get("input", {}),
                             })
 
-                elif event_type == "result":
-                    # Extract any final text from result
-                    result = event.get("result", {})
-                    if isinstance(result, dict):
-                        for block in result.get("content", []):
-                            if isinstance(block, dict) and block.get("type") == "text":
-                                text = block["text"]
-                                if len(text) > len(self.stream_buffer):
-                                    delta = text[len(self.stream_buffer):]
-                                    self.stream_buffer = text
-                                    await self._send_ws({
-                                        "type": "stream.text",
-                                        "text": delta,
-                                    })
+                elif event_type == "user":
+                    content = event.get("message", {}).get("content", [])
+                    if isinstance(content, list):
+                        for item in content:
+                            if isinstance(item, dict) and item.get("type") == "tool_result":
+                                await self._send_ws({
+                                    "type": "stream.tool_result",
+                                    "toolId": item.get("tool_use_id", ""),
+                                    "content": flatten_text_content(item.get("content", "")),
+                                })
 
-                    self.stream_buffer = ""
+                elif event_type == "result":
                     await self._send_ws({
                         "type": "stream.done",
                         "sessionId": self.session_id or "",
@@ -313,9 +449,31 @@ class Session:
 
 # --- Prompt building ---
 
+def flatten_text_content(content) -> str:
+    """Flatten Claude message content (str or list of text blocks) into a plain string."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            b.get("text", "") for b in content
+            if isinstance(b, dict) and b.get("type") == "text"
+        )
+    return str(content)
+
+
 def build_prompt(msg: dict) -> str:
     """Combine user text with optional screenshots/console/server log context."""
     parts = []
+
+    page_url = msg.get("pageUrl")
+    if page_url:
+        source_file = resolve_page_url(page_url)
+        parts.append("## Current Page")
+        if source_file:
+            parts.append(f"URL: `{page_url}` → `{source_file}`")
+        else:
+            parts.append(f"URL: `{page_url}` (no matching source file found)")
+        parts.append("")
 
     if msg.get("consoleLogs"):
         logs = msg["consoleLogs"]
@@ -327,7 +485,7 @@ def build_prompt(msg: dict) -> str:
 
     if msg.get("serverLogs"):
         logs = msg["serverLogs"]
-        parts.append("## Recent Bridge Server Logs")
+        parts.append("## Recent Backend Server Logs")
         parts.append("```")
         parts.append("\n".join(logs))
         parts.append("```")
@@ -339,7 +497,8 @@ def build_prompt(msg: dict) -> str:
 
     for i, screenshot in enumerate(screenshots):
         try:
-            img_bytes = base64.b64decode(screenshot)
+            raw = screenshot.split(",", 1)[-1] if "," in screenshot else screenshot
+            img_bytes = base64.b64decode(raw)
             fd, path = tempfile.mkstemp(suffix=".png", prefix=f"devchat_ss{i}_")
             with os.fdopen(fd, "wb") as f:
                 f.write(img_bytes)
@@ -385,12 +544,20 @@ def parse_jsonl_messages(filepath: str) -> tuple[list[dict], list[dict]]:
                     })
                 elif isinstance(content, list):
                     for item in content:
-                        if isinstance(item, dict) and item.get("type") == "tool_result":
+                        if not isinstance(item, dict):
+                            continue
+                        if item.get("type") == "text":
+                            messages.append({
+                                "type": "text",
+                                "role": "user",
+                                "content": item.get("text", ""),
+                            })
+                        elif item.get("type") == "tool_result":
                             messages.append({
                                 "type": "tool_result",
                                 "role": "tool",
                                 "toolId": item.get("tool_use_id", ""),
-                                "content": str(item.get("content", "")),
+                                "content": flatten_text_content(item.get("content", "")),
                             })
 
             elif entry_type == "assistant":
@@ -466,17 +633,9 @@ def register_session(widget_id: str, session: Session):
 @app.websocket("/")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    log_subscribers.add(websocket)
     current_session: Optional[Session] = None
     current_widget_id: Optional[str] = None
     server_log("Client connected")
-
-    # Send existing log history
-    for entry in log_buffer:
-        try:
-            await websocket.send_json(entry)
-        except Exception:
-            break
 
     try:
         while True:
@@ -493,7 +652,8 @@ async def websocket_endpoint(websocket: WebSocket):
 
             elif msg_type == "chat.cancel":
                 if current_session and current_session.is_alive:
-                    await current_session.cancel()
+                    await current_session.send("Stop. Cancel the current operation and wait for my next message.")
+                    server_log("Sent cancel message to Claude via stdin")
                     await websocket.send_json({
                         "type": "stream.done",
                         "sessionId": current_session.session_id or "",
@@ -585,10 +745,9 @@ async def websocket_endpoint(websocket: WebSocket):
                 server_log("Started new conversation")
                 await websocket.send_json({"type": "chat.cleared"})
 
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, RuntimeError):
         server_log("Client disconnected")
     finally:
-        log_subscribers.discard(websocket)
         if current_session:
             current_session.detach()
         server_log("Client cleaned up (process stays alive)")
@@ -626,7 +785,7 @@ async def get_conversation(session_id: str):
         return JSONResponse({"error": "not found"}, status_code=404)
 
     messages, raw = parse_jsonl_messages(filepath)
-    return {"sessionId": session_id, "messages": messages, "raw": raw}
+    return {"sessionId": session_id, "messages": messages, "raw": raw, "systemPrompts": collect_system_prompts()}
 
 
 @app.get("/conversations")
@@ -688,7 +847,120 @@ async def serve_file(filepath: str):
     return FileResponse(full_path)
 
 
-# --- Shutdown ---
+# --- Git endpoints ---
+
+async def run_git(repo_dir: str, *args: str) -> str:
+    proc = await asyncio.create_subprocess_exec(
+        "git", *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=repo_dir,
+    )
+    stdout, _ = await proc.communicate()
+    return stdout.decode().rstrip()
+
+
+def parse_porcelain_line(line: str) -> dict:
+    if len(line) < 4:
+        return None
+    x, y = line[0], line[1]
+    path = line[3:]
+
+    if " -> " in path:
+        path = path.split(" -> ", 1)[1]
+
+    if x == "?" and y == "?":
+        return {"path": path, "status": "untracked", "staged": False, "unstaged": True}
+
+    staged = x not in (" ", "?")
+    unstaged = y not in (" ", "?")
+    indicator = x if staged else y
+    status_map = {"M": "modified", "A": "added", "D": "deleted", "R": "renamed", "C": "copied"}
+    return {"path": path, "status": status_map.get(indicator, "modified"), "staged": staged, "unstaged": unstaged}
+
+
+@app.get("/git/status")
+async def git_status():
+    repos = []
+    for name, repo_dir in REPOS.items():
+        if not os.path.isdir(repo_dir):
+            continue
+
+        branch, status_output = await asyncio.gather(
+            run_git(repo_dir, "branch", "--show-current"),
+            run_git(repo_dir, "status", "--porcelain"),
+        )
+
+        ahead, behind = 0, 0
+        try:
+            counts = await run_git(repo_dir, "rev-list", "--left-right", "--count", "HEAD...@{upstream}")
+            if counts:
+                parts = counts.split("\t")
+                ahead, behind = int(parts[0]), int(parts[1])
+        except Exception:
+            pass
+
+        files = []
+        for line in status_output.splitlines():
+            parsed = parse_porcelain_line(line)
+            if parsed:
+                files.append(parsed)
+
+        repos.append({
+            "name": name,
+            "branch": branch,
+            "ahead": ahead,
+            "behind": behind,
+            "files": files,
+        })
+
+    return {"repos": repos}
+
+
+@app.get("/git/diff")
+async def git_diff(repo: str, file: str, staged: bool = False, context: int | None = None):
+    repo_dir = REPOS.get(repo)
+    if not repo_dir or not os.path.isdir(repo_dir):
+        return JSONResponse({"error": "unknown repo"}, status_code=404)
+
+    args = ["diff"]
+    if context is not None:
+        args.append(f"-U{max(0, context)}")
+    if staged:
+        args.append("--cached")
+    args.extend(["--", file])
+
+    diff = await run_git(repo_dir, *args)
+
+    if not diff:
+        untracked = await run_git(repo_dir, "ls-files", "--others", "--exclude-standard", "--", file)
+        if untracked.strip():
+            full_path = os.path.join(repo_dir, file)
+            try:
+                with open(full_path, "r", errors="replace") as f:
+                    content = f.read()
+                diff = "\n".join(f"+{line}" for line in content.splitlines())
+            except OSError:
+                pass
+
+    return {"repo": repo, "file": file, "diff": diff}
+
+
+# --- Backend logs endpoint ---
+
+@app.get("/logs")
+async def get_logs():
+    _ingest_backend_log_file()
+    return {"logs": list(log_buffer)}
+
+
+# --- Lifecycle ---
+
+@app.on_event("startup")
+async def startup():
+    if GTV_MODE == "staging":
+        asyncio.create_task(_stream_railway_logs())
+
 
 @app.on_event("shutdown")
 async def shutdown():

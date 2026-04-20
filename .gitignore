@@ -2,5 +2,6 @@ __pycache__/
 *.pyc
 node_modules/
 claude-bridge/data/
+claude-widget/dist/
 prototypes/
 .DS_Store

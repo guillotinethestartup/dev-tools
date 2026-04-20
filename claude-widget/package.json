@@ -2,11 +2,15 @@
   "name": "@guillotine/dev-widget",
   "version": "0.0.0",
   "private": true,
-  "main": "./src/index.ts",
+  "main": "./dist/index.js",
   "types": "./src/index.ts",
   "exports": {
-    ".": "./src/index.ts",
-    "./widget": "./src/DevChatWidget.tsx"
+    ".": "./dist/index.js",
+    "./widget": "./dist/widget.js"
+  },
+  "scripts": {
+    "build": "vite build",
+    "dev": "vite build --watch"
   },
   "peerDependencies": {
     "html2canvas": "^1.4.1",
@@ -15,5 +19,12 @@
     "react-markdown": "^10.1.0",
     "react-syntax-highlighter": "^16.1.1",
     "remark-gfm": "^4.0.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^6.0.1",
+    "vite": "^8.0.8"
+  },
+  "dependencies": {
+    "html2canvas-pro": "^2.0.2"
   }
 }

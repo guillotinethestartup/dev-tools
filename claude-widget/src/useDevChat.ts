@@ -103,12 +103,33 @@ export function useDevChat(ws: DevWebSocket, consoleLogs: { getRecent: (n: numbe
     });
   }, []);
 
+  // Reset streaming state if WebSocket disconnects
+  useEffect(() => {
+    if (ws.status === 'disconnected' && isStreaming) {
+      setIsStreaming(false);
+      streamBufferRef.current = '';
+    }
+  }, [ws.status, isStreaming]);
+
   // Subscribe to WebSocket messages
   useEffect(() => {
     return ws.onMessage((msg: ServerMessage) => {
       switch (msg.type) {
         case 'stream.init':
           setSessionId(msg.sessionId);
+          break;
+
+        case 'stream.system_prompts':
+          setMessages((prev) => {
+            const withoutOld = prev.filter((m) => m.type !== 'system_prompt');
+            const sysMsgs = msg.prompts.map((p) => ({
+              type: 'system_prompt' as const,
+              role: 'system' as const,
+              name: p.name,
+              content: p.content,
+            }));
+            return [...sysMsgs, ...withoutOld];
+          });
           break;
 
         case 'stream.text':
@@ -129,6 +150,7 @@ export function useDevChat(ws: DevWebSocket, consoleLogs: { getRecent: (n: numbe
           break;
 
         case 'stream.tool_use':
+          streamBufferRef.current = '';
           setMessages((prev) => [
             ...prev,
             {
@@ -137,6 +159,18 @@ export function useDevChat(ws: DevWebSocket, consoleLogs: { getRecent: (n: numbe
               name: msg.name,
               toolId: msg.toolId,
               input: msg.input,
+            },
+          ]);
+          break;
+
+        case 'stream.tool_result':
+          setMessages((prev) => [
+            ...prev,
+            {
+              type: 'tool_result',
+              role: 'tool',
+              toolId: msg.toolId,
+              content: msg.content,
             },
           ]);
           break;
@@ -187,12 +221,20 @@ export function useDevChat(ws: DevWebSocket, consoleLogs: { getRecent: (n: numbe
       setIsStreaming(true);
       streamBufferRef.current = '';
 
+      const sendPageUrl = attachments?.pageUrl !== false
+        ? (typeof attachments?.pageUrl === 'string' ? attachments.pageUrl : window.location.pathname)
+        : undefined;
+      const sendConsoleLogs = attachments?.consoleLogs !== false
+        ? (attachments?.consoleLogs ?? consoleLogs.getRecent(50))
+        : undefined;
+
       ws.send({
         type: 'chat.send',
         content: text,
         widgetId,
+        pageUrl: sendPageUrl,
         screenshots: attachments?.screenshots,
-        consoleLogs: attachments?.consoleLogs ?? consoleLogs.getRecent(50),
+        consoleLogs: sendConsoleLogs,
         serverLogs: attachments?.serverLogs,
       });
     },

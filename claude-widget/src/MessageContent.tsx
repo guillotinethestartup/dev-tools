@@ -24,6 +24,7 @@ export const MessageContent = memo(function MessageContent({ content, role }: Pr
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         components={{
+          hr() { return null; },
           code({ className, children, ...props }) {
             const match = /language-(\w+)/.exec(className || '');
             const text = String(children).replace(/\n$/, '');

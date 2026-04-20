@@ -1,4 +1,4 @@
-import { useRef, useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import type { ServerMessage, ClientMessage } from './devChatProtocol';
 
 export type WsStatus = 'connecting' | 'connected' | 'disconnected';
@@ -12,78 +12,105 @@ export interface DevWebSocket {
 
 const WS_URL = 'ws://localhost:9100';
 
-export function useDevWebSocket(): DevWebSocket {
-  const wsRef = useRef<WebSocket | null>(null);
-  const handlersRef = useRef<Set<(msg: ServerMessage) => void>>(new Set());
-  const [status, setStatus] = useState<WsStatus>('disconnected');
-  const [lastError, setLastError] = useState<string | null>(null);
-  const reconnectTimerRef = useRef<number | null>(null);
-  const reconnectDelayRef = useRef(1000);
-  const pingIntervalRef = useRef<number | null>(null);
+// --- Module-level singleton WebSocket ---
+// Lives outside React so it survives HMR, component crashes, and remounts.
 
-  const connect = useCallback(() => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) return;
+const handlers = new Set<(msg: ServerMessage) => void>();
+const statusListeners = new Set<(status: WsStatus) => void>();
 
-    setStatus('connecting');
-    const ws = new WebSocket(WS_URL);
-    wsRef.current = ws;
+let ws: WebSocket | null = null;
+let currentStatus: WsStatus = 'disconnected';
+let reconnectTimer: number | null = null;
+let reconnectDelay = 1000;
+let pingInterval: number | null = null;
 
-    ws.onopen = () => {
-      setStatus('connected');
-      setLastError(null);
-      reconnectDelayRef.current = 1000;
+function setStatus(s: WsStatus) {
+  currentStatus = s;
+  statusListeners.forEach((fn) => fn(s));
+}
 
-      pingIntervalRef.current = window.setInterval(() => {
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: 'ping' }));
-        }
-      }, 30_000);
-    };
+function connect() {
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+    return;
+  }
 
-    ws.onmessage = (event) => {
-      try {
-        const msg: ServerMessage = JSON.parse(event.data);
-        handlersRef.current.forEach((h) => h(msg));
-      } catch {
-        /* ignore parse errors */
+  if (ws) {
+    ws.onclose = null;
+    ws.onerror = null;
+    ws.onmessage = null;
+    ws.close();
+  }
+
+  setStatus('connecting');
+  const socket = new WebSocket(WS_URL);
+  ws = socket;
+
+  socket.onopen = () => {
+    if (ws !== socket) { socket.close(); return; }
+    setStatus('connected');
+    reconnectDelay = 1000;
+
+    pingInterval = window.setInterval(() => {
+      if (socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ type: 'ping' }));
       }
-    };
+    }, 30_000);
+  };
 
-    ws.onclose = () => {
-      setStatus('disconnected');
-      if (pingIntervalRef.current) clearInterval(pingIntervalRef.current);
+  socket.onmessage = (event) => {
+    if (ws !== socket) return;
+    try {
+      const msg: ServerMessage = JSON.parse(event.data);
+      handlers.forEach((h) => h(msg));
+    } catch {
+      /* ignore */
+    }
+  };
 
-      const delay = reconnectDelayRef.current;
-      reconnectDelayRef.current = Math.min(delay * 2, 16_000);
-      reconnectTimerRef.current = window.setTimeout(connect, delay);
-    };
+  socket.onclose = () => {
+    if (ws !== socket) return;
+    setStatus('disconnected');
+    if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
 
-    ws.onerror = () => {
-      setLastError('WebSocket connection failed');
-    };
-  }, []);
+    reconnectTimer = window.setTimeout(() => {
+      reconnectDelay = Math.min(reconnectDelay * 2, 16_000);
+      connect();
+    }, reconnectDelay);
+  };
+
+  socket.onerror = () => {
+    /* onclose will fire after this */
+  };
+}
+
+// Connect immediately on module load
+connect();
+
+function sendMessage(msg: ClientMessage) {
+  if (ws?.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(msg));
+  }
+}
+
+// --- React hook that reads from the singleton ---
+
+export function useDevWebSocket(): DevWebSocket {
+  const [status, setLocalStatus] = useState<WsStatus>(currentStatus);
 
   useEffect(() => {
-    connect();
-    return () => {
-      if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
-      if (pingIntervalRef.current) clearInterval(pingIntervalRef.current);
-      wsRef.current?.close();
-    };
-  }, [connect]);
+    setLocalStatus(currentStatus);
+    statusListeners.add(setLocalStatus);
+    return () => { statusListeners.delete(setLocalStatus); };
+  }, []);
 
   const send = useCallback((msg: ClientMessage) => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify(msg));
-    }
+    sendMessage(msg);
   }, []);
 
   const onMessage = useCallback((handler: (msg: ServerMessage) => void) => {
-    handlersRef.current.add(handler);
-    return () => {
-      handlersRef.current.delete(handler);
-    };
+    handlers.add(handler);
+    return () => { handlers.delete(handler); };
   }, []);
 
-  return { status, send, onMessage, lastError };
+  return { status, send, onMessage, lastError: null };
 }

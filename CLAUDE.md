@@ -94,8 +94,6 @@ Requires `.env` files — see README.md for details.
 
 ## Deploy
 
-1. Run database migrations in Supabase SQL editor
-2. Push backend to `main` (Railway auto-deploys)
-3. Verify backend is live (`/docs`)
-4. Regenerate frontend types: `npm run generate-types` in gtv-frontend (fetches OpenAPI spec from production)
-5. Push frontend
+- Push changes in a feature branch
+- Merging a PR to `staging` auto-deploys to the staging environment
+- Merging a PR to `main` auto-deploys to production

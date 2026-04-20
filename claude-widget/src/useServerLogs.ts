@@ -1,6 +1,4 @@
-import { useRef, useEffect } from 'react';
-import type { DevWebSocket } from './useDevWebSocket';
-import type { ServerMessage } from './devChatProtocol';
+import { useState, useCallback, useEffect } from 'react';
 
 export interface ServerLog {
   text: string;
@@ -8,29 +6,39 @@ export interface ServerLog {
   ts: number;
 }
 
-const MAX_LOGS = 500;
+const BRIDGE_URL = 'http://localhost:9100';
+const POLL_INTERVAL = 3000;
 
 export interface ServerLogsResult {
   getRecent: (n: number) => ServerLog[];
   getAll: () => ServerLog[];
+  refresh: () => Promise<void>;
 }
 
-export function useServerLogs(ws: DevWebSocket): ServerLogsResult {
-  const logsRef = useRef<ServerLog[]>([]);
+export function useServerLogs(active: boolean = true): ServerLogsResult {
+  const [logs, setLogs] = useState<ServerLog[]>([]);
+
+  const refresh = useCallback(async () => {
+    try {
+      const res = await fetch(`${BRIDGE_URL}/logs`);
+      if (!res.ok) return;
+      const data = await res.json();
+      setLogs(data.logs);
+    } catch {
+      // bridge not ready yet
+    }
+  }, []);
 
   useEffect(() => {
-    return ws.onMessage((msg: ServerMessage) => {
-      if (msg.type === 'log.entry') {
-        logsRef.current.push({ text: msg.text, level: msg.level, ts: msg.ts });
-        if (logsRef.current.length > MAX_LOGS) {
-          logsRef.current = logsRef.current.slice(-MAX_LOGS);
-        }
-      }
-    });
-  }, [ws]);
+    if (!active) return;
+    refresh();
+    const id = setInterval(refresh, POLL_INTERVAL);
+    return () => clearInterval(id);
+  }, [active, refresh]);
 
   return {
-    getRecent: (n: number) => logsRef.current.slice(-n),
-    getAll: () => [...logsRef.current],
+    getRecent: (n: number) => logs.slice(-n),
+    getAll: () => logs,
+    refresh,
   };
 }

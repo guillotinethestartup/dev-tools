@@ -2,8 +2,9 @@ export type Quadrant = 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right'
 
 // Attachments passed with a chat message
 export interface ChatAttachments {
+  pageUrl?: string | false;
   screenshots?: string[];
-  consoleLogs?: string[];
+  consoleLogs?: string[] | false;
   serverLogs?: string[];
 }
 
@@ -36,7 +37,14 @@ export interface ErrorMessage {
   content: string;
 }
 
-export type ChatMessage = TextMessage | ToolUseMessage | ToolResultMessage | ErrorMessage;
+export interface SystemPromptMessage {
+  type: 'system_prompt';
+  role: 'system';
+  name: string;
+  content: string;
+}
+
+export type ChatMessage = TextMessage | ToolUseMessage | ToolResultMessage | ErrorMessage | SystemPromptMessage;
 
 // --- Client -> Server ---
 
@@ -44,6 +52,7 @@ export interface ChatSendMessage {
   type: 'chat.send';
   content: string;
   widgetId: string;
+  pageUrl?: string;
   screenshots?: string[];
   consoleLogs?: string[];
   serverLogs?: string[];
@@ -94,6 +103,12 @@ export interface StreamToolUseMessage {
   input: Record<string, unknown>;
 }
 
+export interface StreamToolResultMessage {
+  type: 'stream.tool_result';
+  toolId: string;
+  content: string;
+}
+
 export interface StreamDoneMessage {
   type: 'stream.done';
   sessionId: string;
@@ -112,6 +127,11 @@ export interface ChatSwitchedMessage {
 
 export interface ChatClearedMessage {
   type: 'chat.cleared';
+}
+
+export interface StreamSystemPromptsMessage {
+  type: 'stream.system_prompts';
+  prompts: { name: string; content: string }[];
 }
 
 export interface PongMessage {
@@ -133,8 +153,10 @@ export interface RawEventMessage {
 
 export type ServerMessage =
   | StreamInitMessage
+  | StreamSystemPromptsMessage
   | StreamTextMessage
   | StreamToolUseMessage
+  | StreamToolResultMessage
   | StreamDoneMessage
   | StreamErrorMessage
   | ChatSwitchedMessage
@@ -142,3 +164,30 @@ export type ServerMessage =
   | PongMessage
   | LogEntryMessage
   | RawEventMessage;
+
+// --- Git status types ---
+
+export interface GitFileStatus {
+  path: string;
+  status: 'modified' | 'added' | 'deleted' | 'renamed' | 'untracked' | 'copied';
+  staged: boolean;
+  unstaged: boolean;
+}
+
+export interface GitRepoStatus {
+  name: string;
+  branch: string;
+  ahead: number;
+  behind: number;
+  files: GitFileStatus[];
+}
+
+export interface GitStatusResponse {
+  repos: GitRepoStatus[];
+}
+
+export interface GitDiffResponse {
+  repo: string;
+  file: string;
+  diff: string;
+}

@@ -21,6 +21,17 @@ export function useRawEvents(ws: DevWebSocket): RawEventsResult {
   useEffect(() => {
     return ws.onMessage((msg: ServerMessage) => {
       if (msg.type === 'raw.event') {
+        const eventType = (msg.event as Record<string, unknown>).type;
+
+        // Skip all streaming fragment events
+        if (eventType === 'stream_event') return;
+
+        // Only keep final assistant messages (with stop_reason)
+        if (eventType === 'assistant') {
+          const message = (msg.event as Record<string, unknown>).message as Record<string, unknown> | undefined;
+          if (!message?.stop_reason) return;
+        }
+
         eventsRef.current.push({ event: msg.event, ts: msg.ts });
         if (eventsRef.current.length > MAX_EVENTS) {
           eventsRef.current = eventsRef.current.slice(-MAX_EVENTS);
